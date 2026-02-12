@@ -1,6 +1,6 @@
 """
-A股股票推荐策略
-基于Tushare数据，结合技术分析和基本面筛选
+A股沪深主板股票推荐策略
+专注于10cm涨跌幅的主板股票，区分开盘和收盘推荐策略
 """
 
 import tushare as ts
@@ -11,23 +11,35 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-class StockRecommendationStrategy:
+# ============== 基础类 ==============
+class StockStrategyBase:
+    """策略基类"""
+
     def __init__(self, token):
         """初始化策略"""
         ts.set_token(token)
         self.pro = ts.pro_api()
         self.today = datetime.now().strftime('%Y%m%d')
 
-    def get_stock_list(self):
-        """获取A股股票列表"""
-        # 获取股票基本信息
+    def get_mainboard_stocks(self):
+        """获取沪深主板股票列表 (10cm涨跌幅)"""
+        # 上海主板: 600xxx, 601xxx, 603xxx, 605xxx
+        # 深圳主板: 000xxx, 001xxx
         stock_list = self.pro.stock_basic(
             exchange='',
             list_status='L',
-            fields='ts_code,symbol,name,area,industry,list_date'
+            fields='ts_code,symbol,name,area,industry,list_date,market'
         )
-        # 过滤掉ST股票
-        stock_list = stock_list[~stock_list['name'].str.contains('ST|退')]
+
+        # 过滤主板股票
+        stock_list = stock_list[
+            (stock_list['ts_code'].str.match(r'^60\d{4}$')) |  # 上交所主板
+            (stock_list['ts_code'].str.match(r'^00[01]\d{4}$'))  # 深交所主板
+        ]
+
+        # 过滤掉ST、退市股票
+        stock_list = stock_list[~stock_list['name'].str.contains('ST|退|暂停')]
+
         return stock_list
 
     def get_daily_data(self, ts_code, days=120):
@@ -75,193 +87,152 @@ class StockRecommendationStrategy:
 
         # 成交量变化
         df['volume_ma5'] = df['vol'].rolling(window=5).mean()
+        df['volume_ma10'] = df['vol'].rolling(window=10).mean()
         df['volume_ratio'] = df['vol'] / df['volume_ma5']
 
-        # 最新数据
-        latest = df.iloc[-1]
-        return df, latest
+        # KDJ指标
+        low_min = df['low'].rolling(window=9).min()
+        high_max = df['high'].rolling(window=9).max()
+        rsv = (df['close'] - low_min) / (high_max - low_min) * 100
+        df['k'] = rsv.ewm(com=2, adjust=False).mean()
+        df['d'] = df['k'].ewm(com=2, adjust=False).mean()
+        df['j'] = 3 * df['k'] - 2 * df['d']
 
-    def technical_score(self, latest):
-        """技术面评分 (0-100)"""
+        # 涨停板判断 (10%)
+        df['limit_up'] = df['pct_chg'] >= 9.5
+        df['limit_down'] = df['pct_chg'] <= -9.5
+
+        # 近期连续涨停天数
+        df['consecutive_up'] = 0
+        for i in range(len(df)):
+            if df.iloc[i]['limit_up']:
+                if i > 0 and df.iloc[i-1]['consecutive_up'] > 0:
+                    df.iloc[i, df.columns.get_loc('consecutive_up')] = df.iloc[i-1]['consecutive_up'] + 1
+                else:
+                    df.iloc[i, df.columns.get_loc('consecutive_up')] = 1
+
+        return df
+
+
+# ============== 开盘前策略 (9:25前) ==============
+class OpeningStrategy(StockStrategyBase):
+    """开盘前推荐策略 (9:25前)"""
+
+    def __init__(self, token):
+        super().__init__(token)
+
+    def opening_score(self, df):
+        """开盘前评分 (0-100)"""
+        if df is None or len(df) < 20:
+            return 0, []
+
         score = 0
         reasons = []
+        latest = df.iloc[-1]
+        yesterday = df.iloc[-2] if len(df) >= 2 else None
 
-        # 1. 均线多头排列 (20分)
-        if latest['ma5'] > latest['ma10'] > latest['ma20']:
+        # 1. 昨日涨停连板 (25分)
+        if latest['consecutive_up'] >= 3:
+            score += 25
+            reasons.append(f"{int(latest['consecutive_up'])}连板强势")
+        elif latest['consecutive_up'] >= 2:
             score += 20
+            reasons.append("2连板")
+        elif latest['limit_up']:
+            score += 15
+            reasons.append("昨日涨停")
+
+        # 2. 跳空高开形态 (20分) - 需要实时数据，此处用昨日收盘价判断
+        if yesterday is not None and latest['close'] > latest['open']:
+            gap_ratio = (latest['open'] - yesterday['close']) / yesterday['close'] * 100
+            if gap_ratio > 3:
+                score += 20
+                reasons.append("跳空高开潜力")
+            elif gap_ratio > 1:
+                score += 12
+                reasons.append("小幅跳空")
+
+        # 3. 均线多头排列 (15分)
+        if latest['ma5'] > latest['ma10'] > latest['ma20']:
+            score += 15
             reasons.append("均线多头排列")
         elif latest['ma5'] > latest['ma20']:
-            score += 10
-            reasons.append("短期均线向上")
-
-        # 2. 价格在20日均线上方 (10分)
-        if latest['close'] > latest['ma20']:
-            score += 10
-            reasons.append("价格站上20日线")
-
-        # 3. RSI超卖反弹 (15分)
-        if 30 <= latest['rsi'] <= 45:
-            score += 15
-            reasons.append("RSI处于超卖反弹区")
-        elif 45 < latest['rsi'] < 70:
-            score += 10
-            reasons.append("RSI处于合理区间")
-
-        # 4. MACD金叉 (20分)
-        if latest['macd'] > latest['signal'] and latest['hist'] > 0:
-            score += 20
-            reasons.append("MACD金叉")
-
-        # 5. 成交量放大 (15分)
-        if latest['volume_ratio'] > 1.5:
-            score += 15
-            reasons.append("成交量显著放大")
-        elif latest['volume_ratio'] > 1.2:
             score += 8
-            reasons.append("成交量温和放大")
+            reasons.append("短期趋势向上")
 
-        # 6. 布林带位置 (10分)
-        if latest['close'] > latest['bb_mid'] and latest['close'] < latest['bb_upper']:
+        # 4. 成交量异常放大 (15分)
+        if latest['volume_ratio'] > 2:
+            score += 15
+            reasons.append("昨日巨量换手")
+        elif latest['volume_ratio'] > 1.5:
             score += 10
-            reasons.append("价格位于布林带中轨上方")
-        elif latest['close'] < latest['bb_lower']:
-            score += 5
-            reasons.append("价格触及布林带下轨")
+            reasons.append("昨日放量")
 
-        # 7. 近期涨幅 (10分)
-        if latest['pct_chg'] > 0 and latest['pct_chg'] < 7:
-            score += 10
-            reasons.append("温和上涨")
-        elif latest['pct_chg'] < 0:
-            score += 5
-            reasons.append("回调买入机会")
+        # 5. RSI金叉信号 (10分)
+        if yesterday is not None and 30 < latest['rsi'] < 70:
+            if yesterday['rsi'] < latest['rsi']:
+                score += 10
+                reasons.append("RSI向上")
+            else:
+                score += 5
+                reasons.append("RSI合理区间")
+
+        # 6. KDJ低位金叉 (15分)
+        if yesterday is not None:
+            if (latest['k'] > latest['d'] and yesterday['k'] <= yesterday['d'] and
+                latest['k'] < 40):
+                score += 15
+                reasons.append("KDJ低位金叉")
+            elif latest['j'] > 100:
+                score += 8
+                reasons.append("KDJ超强势")
 
         return score, reasons
 
-    def get_financial_data(self, ts_code):
-        """获取基本面数据"""
-        try:
-            # 获取最新财务指标
-            df = self.pro.fina_indicator(ts_code=ts_code, period='20241231')
-            if df.empty:
-                df = self.pro.fina_indicator(ts_code=ts_code)
-            if df.empty:
-                return None
-            return df.iloc[0]
-        except:
-            return None
+    def get_limit_up_stocks(self, date=None):
+        """获取涨停股票列表"""
+        if date is None:
+            date = datetime.now().strftime('%Y%m%d')
+        df = self.pro.limit_list_d(trade_date=date, limit_type='U')
+        if df.empty:
+            # 如果没有当天数据，获取最近一个交易日
+            df = self.pro.limit_list_d(limit_type='U')
+            if not df.empty:
+                df = df[df['trade_date'] == df['trade_date'].max()]
+        return df
 
-    def fundamental_score(self, financial_data):
-        """基本面评分 (0-100)"""
-        if financial_data is None:
-            return 0, ["无财务数据"]
-
-        score = 0
-        reasons = []
-
-        # 1. ROE (25分)
-        if financial_data.get('roe', 0) > 20:
-            score += 25
-            reasons.append(f"ROE优秀: {financial_data.get('roe', 0):.2f}%")
-        elif financial_data.get('roe', 0) > 15:
-            score += 18
-            reasons.append(f"ROE良好: {financial_data.get('roe', 0):.2f}%")
-        elif financial_data.get('roe', 0) > 10:
-            score += 12
-            reasons.append(f"ROE尚可: {financial_data.get('roe', 0):.2f}%")
-
-        # 2. 毛利率 (20分)
-        if financial_data.get('gross_profit_margin', 0) > 40:
-            score += 20
-            reasons.append(f"毛利率高: {financial_data.get('gross_profit_margin', 0):.2f}%")
-        elif financial_data.get('gross_profit_margin', 0) > 25:
-            score += 15
-            reasons.append(f"毛利率较好: {financial_data.get('gross_profit_margin', 0):.2f}%")
-
-        # 3. 营收增长 (20分)
-        if financial_data.get('or_yoy', 0) > 30:
-            score += 20
-            reasons.append(f"营收高增长: {financial_data.get('or_yoy', 0):.2f}%")
-        elif financial_data.get('or_yoy', 0) > 15:
-            score += 15
-            reasons.append(f"营收增长良好: {financial_data.get('or_yoy', 0):.2f}%")
-        elif financial_data.get('or_yoy', 0) > 0:
-            score += 10
-            reasons.append(f"营收正增长: {financial_data.get('or_yoy', 0):.2f}%")
-
-        # 4. 净利润增长 (20分)
-        if financial_data.get('profit_yoy', 0) > 30:
-            score += 20
-            reasons.append(f"净利润高增长: {financial_data.get('profit_yoy', 0):.2f}%")
-        elif financial_data.get('profit_yoy', 0) > 15:
-            score += 15
-            reasons.append(f"净利润增长良好: {financial_data.get('profit_yoy', 0):.2f}%")
-        elif financial_data.get('profit_yoy', 0) > 0:
-            score += 10
-            reasons.append(f"净利润正增长: {financial_data.get('profit_yoy', 0):.2f}%")
-
-        # 5. 负债率 (15分)
-        debt_ratio = financial_data.get('debt_to_assets', 0)
-        if 0 < debt_ratio < 40:
-            score += 15
-            reasons.append(f"负债率低: {debt_ratio:.2f}%")
-        elif 40 <= debt_ratio < 60:
-            score += 10
-            reasons.append(f"负债率合理: {debt_ratio:.2f}%")
-        elif debt_ratio < 80:
-            score += 5
-            reasons.append(f"负债率偏高: {debt_ratio:.2f}%")
-
-        return score, reasons
-
-    def get_realtime_quote(self, ts_code):
-        """获取实时行情"""
-        try:
-            df = self.pro.daily(ts_code=ts_code, limit='1')
-            if df.empty:
-                return None
-            return df.iloc[0]
-        except:
-            return None
-
-    def analyze_stock(self, stock_info):
-        """综合分析单只股票"""
+    def analyze_stock_opening(self, stock_info):
+        """开盘前分析单只股票"""
         ts_code = stock_info['ts_code']
         stock_name = stock_info['name']
         industry = stock_info.get('industry', '')
 
         # 获取日线数据
         daily_data = self.get_daily_data(ts_code)
-        if daily_data is None or len(daily_data) < 60:
+        if daily_data is None or len(daily_data) < 30:
             return None
 
         # 计算技术指标
-        result = self.calculate_indicators(daily_data)
-        if result is None:
+        df = self.calculate_indicators(daily_data)
+        if df is None:
             return None
-        df, latest = result
 
-        # 技术面评分
-        tech_score, tech_reasons = self.technical_score(latest)
+        latest = df.iloc[-1]
 
-        # 基本面评分
-        financial_data = self.get_financial_data(ts_code)
-        fund_score, fund_reasons = self.fundamental_score(financial_data)
-
-        # 综合评分 (技术面60% + 基本面40%)
-        total_score = tech_score * 0.6 + fund_score * 0.4
+        # 开盘前评分
+        score, reasons = self.opening_score(df)
 
         # 判断推荐等级
-        if total_score >= 75:
-            level = "强烈推荐"
+        if score >= 75:
+            level = "强烈关注"
             emoji = "★★★★★"
-        elif total_score >= 60:
-            level = "推荐"
+        elif score >= 60:
+            level = "关注"
             emoji = "★★★★"
-        elif total_score >= 45:
-            level = "谨慎关注"
+        elif score >= 45:
+            level = "谨慎观察"
             emoji = "★★★"
-        elif total_score >= 30:
+        elif score >= 30:
             level = "观望"
             emoji = "★★"
         else:
@@ -272,32 +243,266 @@ class StockRecommendationStrategy:
             'ts_code': ts_code,
             'name': stock_name,
             'industry': industry,
-            'price': latest['close'],
+            'close_price': latest['close'],
             'pct_chg': latest['pct_chg'],
-            'tech_score': round(tech_score, 1),
-            'fund_score': round(fund_score, 1),
-            'total_score': round(total_score, 1),
+            'score': round(score, 1),
             'level': level,
             'emoji': emoji,
-            'tech_reasons': tech_reasons,
-            'fund_reasons': fund_reasons,
+            'reasons': reasons,
+            'consecutive_up': int(latest['consecutive_up']),
+            'volume_ratio': round(latest['volume_ratio'], 2) if pd.notna(latest['volume_ratio']) else None,
             'ma5': round(latest['ma5'], 2),
             'ma20': round(latest['ma20'], 2),
             'rsi': round(latest['rsi'], 1) if pd.notna(latest['rsi']) else None,
-            'macd': round(latest['macd'], 4) if pd.notna(latest['macd']) else None,
-            'volume_ratio': round(latest['volume_ratio'], 2) if pd.notna(latest['volume_ratio']) else None
+            'k': round(latest['k'], 1) if pd.notna(latest['k']) else None,
+            'd': round(latest['d'], 1) if pd.notna(latest['d']) else None,
         }
 
-    def scan_market(self, stock_list=None, top_n=20):
-        """扫描市场并推荐股票"""
-        print(f"\n{'='*60}")
-        print(f"A股股票推荐策略 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*60}\n")
+    def scan_opening(self, top_n=20):
+        """开盘前扫描"""
+        print(f"\n{'='*70}")
+        print(f"【开盘前推荐策略】{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*70}\n")
 
-        if stock_list is None:
-            print("正在获取股票列表...")
-            stock_list = self.get_stock_list()
-            print(f"共获取 {len(stock_list)} 只股票\n")
+        # 获取主板股票列表
+        print("正在获取沪深主板股票列表...")
+        stock_list = self.get_mainboard_stocks()
+        print(f"共获取 {len(stock_list)} 只沪深主板股票\n")
+
+        # 优先获取涨停股票
+        print("正在获取昨日涨停股票...")
+        limit_up_stocks = self.get_limit_up_stocks()
+        limit_codes = limit_up_stocks['ts_code'].tolist() if not limit_up_stocks.empty else []
+        print(f"昨日涨停: {len(limit_codes)} 只\n")
+
+        results = []
+        total = len(stock_list)
+
+        # 先分析涨停股票
+        if limit_codes:
+            limit_stocks = stock_list[stock_list['ts_code'].isin(limit_codes)]
+            for idx, stock in limit_stocks.iterrows():
+                print(f"\r分析涨停股票: {idx+1}/{len(limit_stocks)} - {stock['name']}", end='')
+                try:
+                    result = self.analyze_stock_opening(stock)
+                    if result and result['score'] > 30:
+                        results.append(result)
+                except Exception as e:
+                    continue
+
+        # 再分析其他股票
+        for idx, stock in stock_list.iterrows():
+            if stock['ts_code'] in limit_codes:
+                continue
+            print(f"\r分析进度: {idx+1}/{total} ({(idx+1)/total*100:.1f}%) - {stock['name']}", end='')
+
+            try:
+                result = self.analyze_stock_opening(stock)
+                # 只保留分数较高的
+                if result and result['score'] > 45:
+                    results.append(result)
+            except Exception as e:
+                continue
+
+        print("\n")
+
+        # 按评分排序
+        results.sort(key=lambda x: x['score'], reverse=True)
+
+        # 输出结果
+        self._print_results(results, top_n, "开盘前")
+
+        return results
+
+    def _print_results(self, results, top_n, strategy_name):
+        """打印结果"""
+        print(f"\n{'='*70}")
+        print(f"TOP {top_n} 【{strategy_name}】推荐股票")
+        print(f"{'='*70}\n")
+
+        for i, stock in enumerate(results[:top_n], 1):
+            print(f"{i}. {stock['emoji']} {stock['name']} ({stock['ts_code']})")
+            print(f"   行业: {stock['industry']}")
+            print(f"   昨收: {stock['close_price']:.2f}  涨跌幅: {stock['pct_chg']:+.2f}%")
+            print(f"   评分: {stock['score']:.1f}  等级: {stock['level']}")
+            if stock['consecutive_up'] > 0:
+                print(f"   连板: {stock['consecutive_up']}板")
+            if stock['volume_ratio']:
+                print(f"   量比: {stock['volume_ratio']:.2f}")
+            print(f"   理由: {', '.join(stock['reasons'])}")
+            print()
+
+        # 统计
+        strong = len([r for r in results if r['level'] == '强烈关注'])
+        follow = len([r for r in results if r['level'] == '关注'])
+        watch = len([r for r in results if r['level'] == '谨慎观察'])
+
+        print(f"{'='*70}")
+        print(f"统计: 强烈关注{strong} | 关注{follow} | 谨慎观察{watch} | 总计{len(results)}")
+        print(f"{'='*70}\n")
+
+        # 保存CSV
+        df = pd.DataFrame(results)
+        csv_file = f"opening_recommendations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+        print(f"结果已保存: {csv_file}\n")
+
+
+# ============== 收盘前策略 (14:56前) ==============
+class ClosingStrategy(StockStrategyBase):
+    """收盘前推荐策略 (14:56前)"""
+
+    def __init__(self, token):
+        super().__init__(token)
+
+    def closing_score(self, df):
+        """收盘前评分 (0-100)"""
+        if df is None or len(df) < 20:
+            return 0, []
+
+        score = 0
+        reasons = []
+        latest = df.iloc[-1]
+
+        # 1. 尾盘拉升形态 (25分) - 收盘价高于开盘价且接近最高价
+        if latest['close'] > latest['open']:
+            gain = (latest['close'] - latest['open']) / latest['open'] * 100
+            close_to_high = (latest['high'] - latest['close']) / latest['close'] * 100
+
+            if gain > 5 and close_to_high < 1:
+                score += 25
+                reasons.append("强势尾盘拉升")
+            elif gain > 3 and close_to_high < 2:
+                score += 18
+                reasons.append("尾盘拉升")
+            elif gain > 0:
+                score += 10
+                reasons.append("收阳线")
+
+        # 2. 技术形态突破 (25分)
+        # 突破20日均线
+        if latest['close'] > latest['ma20'] and df.iloc[-2]['close'] <= df.iloc[-2]['ma20']:
+            score += 15
+            reasons.append("突破20日线")
+
+        # 突破布林带上轨
+        if latest['close'] > latest['bb_upper']:
+            score += 10
+            reasons.append("突破布林上轨")
+
+        # 3. 成交量配合 (20分)
+        if latest['volume_ratio'] > 2:
+            score += 20
+            reasons.append("巨量配合")
+        elif latest['volume_ratio'] > 1.5:
+            score += 15
+            reasons.append("放量")
+        elif latest['volume_ratio'] > 1.2:
+            score += 10
+            reasons.append("温和放量")
+
+        # 4. MACD信号 (15分)
+        if latest['macd'] > latest['signal'] and latest['hist'] > df.iloc[-2]['hist']:
+            score += 15
+            reasons.append("MACD加速向上")
+        elif latest['macd'] > latest['signal']:
+            score += 10
+            reasons.append("MACD金叉")
+
+        # 5. RSI合理区间 (10分)
+        if 50 < latest['rsi'] < 70:
+            score += 10
+            reasons.append("RSI强势区")
+        elif 40 < latest['rsi'] <= 50:
+            score += 6
+            reasons.append("RSI上升区")
+        elif 70 <= latest['rsi'] < 80:
+            score += 5
+            reasons.append("RSI接近超买")
+
+        # 6. K线形态 (5分)
+        body = abs(latest['close'] - latest['open'])
+        upper_shadow = latest['high'] - max(latest['close'], latest['open'])
+        lower_shadow = min(latest['close'], latest['open']) - latest['low']
+
+        # 大阳线
+        if body > lower_shadow * 2 and upper_shadow < body * 0.3:
+            score += 5
+            reasons.append("大阳线形态")
+        # 突破形态
+        elif latest['close'] == latest['high']:
+            score += 3
+            reasons.append("光头阳线")
+
+        return score, reasons
+
+    def analyze_stock_closing(self, stock_info):
+        """收盘前分析单只股票"""
+        ts_code = stock_info['ts_code']
+        stock_name = stock_info['name']
+        industry = stock_info.get('industry', '')
+
+        # 获取日线数据
+        daily_data = self.get_daily_data(ts_code)
+        if daily_data is None or len(daily_data) < 30:
+            return None
+
+        # 计算技术指标
+        df = self.calculate_indicators(daily_data)
+        if df is None:
+            return None
+
+        latest = df.iloc[-1]
+
+        # 收盘前评分
+        score, reasons = self.closing_score(df)
+
+        # 判断推荐等级
+        if score >= 75:
+            level = "强烈推荐"
+            emoji = "★★★★★"
+        elif score >= 60:
+            level = "推荐"
+            emoji = "★★★★"
+        elif score >= 45:
+            level = "谨慎关注"
+            emoji = "★★★"
+        elif score >= 30:
+            level = "观望"
+            emoji = "★★"
+        else:
+            level = "不推荐"
+            emoji = "★"
+
+        return {
+            'ts_code': ts_code,
+            'name': stock_name,
+            'industry': industry,
+            'close_price': latest['close'],
+            'pct_chg': latest['pct_chg'],
+            'score': round(score, 1),
+            'level': level,
+            'emoji': emoji,
+            'reasons': reasons,
+            'volume_ratio': round(latest['volume_ratio'], 2) if pd.notna(latest['volume_ratio']) else None,
+            'ma5': round(latest['ma5'], 2),
+            'ma20': round(latest['ma20'], 2),
+            'ma60': round(latest['ma60'], 2),
+            'rsi': round(latest['rsi'], 1) if pd.notna(latest['rsi']) else None,
+            'macd': round(latest['macd'], 4) if pd.notna(latest['macd']) else None,
+            'bb_upper': round(latest['bb_upper'], 2),
+        }
+
+    def scan_closing(self, top_n=20):
+        """收盘前扫描"""
+        print(f"\n{'='*70}")
+        print(f"【收盘前推荐策略】{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*70}\n")
+
+        # 获取主板股票列表
+        print("正在获取沪深主板股票列表...")
+        stock_list = self.get_mainboard_stocks()
+        print(f"共获取 {len(stock_list)} 只沪深主板股票\n")
 
         results = []
         total = len(stock_list)
@@ -306,76 +511,97 @@ class StockRecommendationStrategy:
             print(f"\r分析进度: {idx+1}/{total} ({(idx+1)/total*100:.1f}%) - {stock['name']}", end='')
 
             try:
-                result = self.analyze_stock(stock)
-                if result and result['total_score'] > 40:
+                result = self.analyze_stock_closing(stock)
+                if result and result['score'] > 40:
                     results.append(result)
             except Exception as e:
                 continue
 
         print("\n")
 
-        # 按综合评分排序
-        results.sort(key=lambda x: x['total_score'], reverse=True)
+        # 按评分排序
+        results.sort(key=lambda x: x['score'], reverse=True)
 
-        # 输出推荐结果
-        print(f"\n{'='*60}")
-        print(f"TOP {top_n} 推荐股票")
-        print(f"{'='*60}\n")
+        # 输出结果
+        self._print_results(results, top_n, "收盘前")
+
+        return results
+
+    def _print_results(self, results, top_n, strategy_name):
+        """打印结果"""
+        print(f"\n{'='*70}")
+        print(f"TOP {top_n} 【{strategy_name}】推荐股票")
+        print(f"{'='*70}\n")
 
         for i, stock in enumerate(results[:top_n], 1):
             print(f"{i}. {stock['emoji']} {stock['name']} ({stock['ts_code']})")
             print(f"   行业: {stock['industry']}")
-            print(f"   现价: {stock['price']:.2f}  涨跌幅: {stock['pct_chg']:+.2f}%")
-            print(f"   综合评分: {stock['total_score']:.1f} | 技术面: {stock['tech_score']:.1f} | 基本面: {stock['fund_score']:.1f}")
-            print(f"   MA5: {stock['ma5']:.2f} | MA20: {stock['ma20']:.2f}")
+            print(f"   收盘价: {stock['close_price']:.2f}  涨跌幅: {stock['pct_chg']:+.2f}%")
+            print(f"   综合评分: {stock['score']:.1f}  等级: {stock['level']}")
+            print(f"   MA5: {stock['ma5']:.2f} | MA20: {stock['ma20']:.2f} | MA60: {stock['ma60']:.2f}")
             if stock['rsi']:
                 print(f"   RSI: {stock['rsi']:.1f}")
             if stock['volume_ratio']:
                 print(f"   量比: {stock['volume_ratio']:.2f}")
-            print(f"   推荐等级: {stock['level']}")
-            print(f"   技术面理由: {', '.join(stock['tech_reasons'])}")
-            if stock['fund_reasons']:
-                print(f"   基本面理由: {', '.join(stock['fund_reasons'])}")
+            print(f"   理由: {', '.join(stock['reasons'])}")
             print()
 
-        # 统计信息
-        strong_buy = len([r for r in results if r['level'] == '强烈推荐'])
+        # 统计
+        strong = len([r for r in results if r['level'] == '强烈推荐'])
         buy = len([r for r in results if r['level'] == '推荐'])
         hold = len([r for r in results if r['level'] == '谨慎关注'])
 
-        print(f"{'='*60}")
-        print(f"统计信息:")
-        print(f"  强烈推荐: {strong_buy} 只")
-        print(f"  推荐: {buy} 只")
-        print(f"  谨慎关注: {hold} 只")
-        print(f"  总计符合条件: {len(results)} 只")
-        print(f"{'='*60}\n")
+        print(f"{'='*70}")
+        print(f"统计: 强烈推荐{strong} | 推荐{buy} | 谨慎关注{hold} | 总计{len(results)}")
+        print(f"{'='*70}\n")
 
-        # 保存结果到CSV
-        df_results = pd.DataFrame(results)
-        csv_file = f"stock_recommendations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        df_results.to_csv(csv_file, index=False, encoding='utf-8-sig')
-        print(f"结果已保存到: {csv_file}\n")
-
-        return results
+        # 保存CSV
+        df = pd.DataFrame(results)
+        csv_file = f"closing_recommendations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+        print(f"结果已保存: {csv_file}\n")
 
 
+# ============== 主函数 ==============
 def main():
     """主函数"""
-    # Tushare API Token
     TOKEN = '2d3ab38a292d8548cf2bb8b1eaccc06268c3945c3eb556d647e8ccdf'
 
-    # 创建策略实例
-    strategy = StockRecommendationStrategy(TOKEN)
+    # 根据当前时间选择策略
+    now = datetime.now()
+    hour = now.hour
+    minute = now.minute
 
-    # 选项1: 分析全市场（需要较长时间）
-    results = strategy.scan_market(top_n=15)
+    print(f"\n当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n请选择推荐策略:")
+    print(f"  1. 开盘前推荐 (适合9:25前运行)")
+    print(f"  2. 收盘前推荐 (适合14:56前运行)")
+    print(f"  3. 同时运行两种策略")
 
-    # 选项2: 分析指定股票列表
-    # target_stocks = ['000001.SZ', '600000.SH', '600519.SH', '300750.SZ']
-    # stock_list = strategy.pro.stock_basic(ts_code=target_stocks,
-    #                                       fields='ts_code,symbol,name,area,industry,list_date')
-    # results = strategy.scan_market(stock_list=stock_list, top_n=10)
+    choice = input("\n请输入选项 (1/2/3): ").strip()
+
+    if choice == '1':
+        print("\n执行开盘前推荐策略...")
+        strategy = OpeningStrategy(TOKEN)
+        results = strategy.scan_opening(top_n=20)
+
+    elif choice == '2':
+        print("\n执行收盘前推荐策略...")
+        strategy = ClosingStrategy(TOKEN)
+        results = strategy.scan_closing(top_n=20)
+
+    elif choice == '3':
+        print("\n执行开盘前推荐策略...")
+        opening = OpeningStrategy(TOKEN)
+        opening_results = opening.scan_opening(top_n=15)
+
+        print("\n" + "="*70)
+        print("\n执行收盘前推荐策略...")
+        closing = ClosingStrategy(TOKEN)
+        closing_results = closing.scan_closing(top_n=15)
+
+    else:
+        print("\n无效选项!")
 
 
 if __name__ == '__main__':
